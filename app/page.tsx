@@ -16,13 +16,10 @@ export default function Home() {
   const router = useRouter()
   const [companies, setCompanies] = useState<Company[]>([])
   const [target, setTarget] = useState('')
-  const [customTarget, setCustomTarget] = useState('')
   const [quarter, setQuarter] = useState('Q4FY26')
   const [peers, setPeers] = useState<string[]>([])
-  const [customPeer, setCustomPeer] = useState('')
   const [loading, setLoading] = useState(false)
 
-  // Fetch companies already in corpus
   useEffect(() => {
     fetch('/api/companies')
       .then(r => r.json())
@@ -30,104 +27,77 @@ export default function Home() {
       .catch(() => {})
   }, [])
 
-  // Combine corpus companies + default list, deduplicated
   const corpusNames = companies.map(c => c.name)
-  const allCompanies = [
-    ...corpusNames,
-    ...INDIAN_IT_COMPANIES.filter(c => !corpusNames.includes(c)),
-  ]
-
-  const effectiveTarget = target === '__custom__' ? customTarget : target
+  const allCompanies = [...new Set([...corpusNames, ...INDIAN_IT_COMPANIES])]
 
   function togglePeer(name: string) {
-    setPeers(prev =>
-      prev.includes(name) ? prev.filter(p => p !== name) : [...prev, name]
-    )
+    if (name === target) return // can't be both target and peer
+    setPeers(prev => prev.includes(name) ? prev.filter(p => p !== name) : [...prev, name])
   }
 
-  function addCustomPeer() {
-    const trimmed = customPeer.trim()
-    if (trimmed && !peers.includes(trimmed)) {
-      setPeers(prev => [...prev, trimmed])
-    }
-    setCustomPeer('')
+  // Remove target from peers if re-selected
+  function handleTargetChange(val: string) {
+    setTarget(val)
+    setPeers(prev => prev.filter(p => p !== val))
   }
 
   async function handleStart(e: React.FormEvent) {
     e.preventDefault()
-    if (!effectiveTarget || !quarter) return
+    if (!target || !quarter) return
     setLoading(true)
 
-    // Upsert target company into corpus if new
     await fetch('/api/companies', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: effectiveTarget }),
+      body: JSON.stringify({ name: target }),
     })
-
-    // Upsert any new peer companies
-    await Promise.all(
-      peers.map(p =>
-        fetch('/api/companies', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: p }),
-        })
-      )
-    )
+    await Promise.all(peers.map(p =>
+      fetch('/api/companies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: p }),
+      })
+    ))
 
     const peerParam = peers.length ? `?peers=${encodeURIComponent(peers.join(','))}` : ''
-    router.push(`/session/${encodeURIComponent(effectiveTarget)}/${quarter}${peerParam}`)
+    router.push(`/session/${encodeURIComponent(target)}/${quarter}${peerParam}`)
   }
 
-  const peersAvailable = allCompanies.filter(c => c !== effectiveTarget)
+  const availablePeers = allCompanies.filter(c => c !== target)
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center px-4 py-12">
-      <div className="w-full max-w-xl">
+    <div className="min-h-[calc(100vh-49px)] flex flex-col items-center justify-center px-4 py-12 bg-gray-50">
+      <div className="w-full max-w-lg">
 
         {/* Header */}
         <div className="text-center mb-10">
           <h1 className="text-2xl font-bold text-gray-900">Analyst Q&A Prediction Agent</h1>
-          <p className="text-gray-400 text-sm mt-1">
-            Select a target, quarter, and peer set to begin.
-          </p>
+          <p className="text-gray-500 text-sm mt-1">Select a target company, quarter, and peer set to begin.</p>
         </div>
 
-        <form onSubmit={handleStart} className="space-y-6">
+        <form onSubmit={handleStart} className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm space-y-6">
 
           {/* Target company */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">
               Target company <span className="text-red-400">*</span>
             </label>
             <select
               value={target}
-              onChange={e => setTarget(e.target.value)}
+              onChange={e => handleTargetChange(e.target.value)}
               required
-              className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-sm text-gray-900 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
             >
-              <option value="">Select target company…</option>
+              <option value="" disabled>Select target company…</option>
               {allCompanies.map(c => (
                 <option key={c} value={c}>{c}</option>
               ))}
-              <option value="__custom__">Other — type below</option>
             </select>
-            {target === '__custom__' && (
-              <input
-                type="text"
-                placeholder="Company name"
-                value={customTarget}
-                onChange={e => setCustomTarget(e.target.value)}
-                required
-                className="mt-2 w-full border border-gray-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-            )}
           </div>
 
           {/* Quarter */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">
               Quarter <span className="text-red-400">*</span>
             </label>
             <div className="flex gap-2 flex-wrap">
@@ -139,7 +109,7 @@ export default function Home() {
                   className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
                     quarter === q
                       ? 'bg-blue-600 text-white border-blue-600'
-                      : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'
+                      : 'bg-white text-gray-700 border-gray-300 hover:border-blue-400 hover:text-blue-600'
                   }`}
                 >
                   {q}
@@ -150,56 +120,42 @@ export default function Home() {
 
           {/* Peer set */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label className="block text-sm font-medium text-gray-700 mb-0.5">
               Peer set
-              <span className="text-gray-400 font-normal ml-1">(optional — select all that apply)</span>
+              <span className="text-gray-400 font-normal text-xs ml-1">(optional)</span>
             </label>
-            <div className="flex flex-wrap gap-2 mb-2">
-              {peersAvailable.map(c => (
-                <button
-                  key={c}
-                  type="button"
-                  onClick={() => togglePeer(c)}
-                  className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
-                    peers.includes(c)
-                      ? 'bg-blue-600 text-white border-blue-600'
-                      : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'
-                  }`}
-                >
-                  {peers.includes(c) ? '✓ ' : ''}{c}
-                </button>
-              ))}
-            </div>
-            {/* Add custom peer */}
-            <div className="flex gap-2 mt-2">
-              <input
-                type="text"
-                placeholder="Add another company…"
-                value={customPeer}
-                onChange={e => setCustomPeer(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addCustomPeer() } }}
-                className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-              <button
-                type="button"
-                onClick={addCustomPeer}
-                className="px-3 py-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 text-gray-600"
-              >
-                Add
-              </button>
+            <p className="text-xs text-gray-400 mb-2">Select all peer companies to include in prediction corroboration.</p>
+            <div className="border border-gray-200 rounded-lg overflow-hidden">
+              <div className="max-h-48 overflow-y-auto divide-y divide-gray-100">
+                {availablePeers.map(c => (
+                  <label
+                    key={c}
+                    className="flex items-center gap-3 px-4 py-2.5 hover:bg-gray-50 cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={peers.includes(c)}
+                      onChange={() => togglePeer(c)}
+                      className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    <span className="text-sm text-gray-800">{c}</span>
+                    {corpusNames.includes(c) && (
+                      <span className="ml-auto text-xs text-green-600 font-medium">In corpus</span>
+                    )}
+                  </label>
+                ))}
+              </div>
             </div>
             {peers.length > 0 && (
-              <p className="text-xs text-gray-400 mt-2">
-                {peers.length} peer{peers.length > 1 ? 's' : ''} selected: {peers.join(', ')}
-              </p>
+              <p className="text-xs text-blue-600 mt-1.5 font-medium">{peers.length} peer{peers.length > 1 ? 's' : ''} selected</p>
             )}
           </div>
 
           {/* Submit */}
           <button
             type="submit"
-            disabled={!effectiveTarget || !quarter || loading}
-            className="w-full py-3 px-4 bg-blue-600 text-white text-sm font-semibold rounded-lg hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            disabled={!target || !quarter || loading}
+            className="w-full py-2.5 px-4 bg-blue-600 text-white text-sm font-semibold rounded-lg hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             {loading ? 'Starting session…' : 'Start prep session →'}
           </button>
@@ -207,7 +163,7 @@ export default function Home() {
         </form>
 
         {/* Footer links */}
-        <div className="mt-8 flex justify-center gap-6 text-xs text-gray-400">
+        <div className="mt-5 flex justify-center gap-6 text-xs text-gray-400">
           <a href="/upload" className="hover:text-gray-600">Upload documents</a>
           <a href="/api-test" className="hover:text-gray-600">Test API</a>
         </div>

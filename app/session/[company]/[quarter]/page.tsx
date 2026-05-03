@@ -12,18 +12,26 @@ const DOC_TYPE_LABELS: Record<string, string> = {
   other: 'Other',
 }
 
+const ZONE_LABELS: Record<number, { name: string; description: string; color: string }> = {
+  1: { name: 'Zone 1 — Analyst Predictions', description: 'Named analyst · scored · evidence cited', color: 'blue' },
+  2: { name: 'Zone 2 — Unasked Signal Flags', description: 'Analyst flagged in report but didn\'t ask on the call', color: 'amber' },
+  3: { name: 'Zone 3 — Unowned Signals', description: 'Model-generated · no analyst attribution', color: 'purple' },
+}
+
 interface Document {
-  id: string
-  company_id: string
-  quarter: string
-  doc_type: string
-  source: string
-  file_name: string
-  ingested_at: string
-  extraction_status: string
-  analyst_firm?: string
-  analyst_name?: string
+  id: string; company_id: string; quarter: string; doc_type: string
+  source: string; file_name: string; ingested_at: string
+  extraction_status: string; analyst_firm?: string; analyst_name?: string
   companies: { name: string }
+}
+
+interface Prediction {
+  id: string; zone: number; possibility_score: number; predicted_question: string
+  signal_strength: string; analyst_pattern_score: number; season_corroboration_score: number
+  peer_transcripts_count: number; insufficient_history_flag: boolean; season_driven_flag: boolean
+  evidence_type: string; evidence_source: string; dismissed: boolean
+  analysts?: { name: string; firm: string }
+  taxonomy_signals?: { name: string }
 }
 
 interface Props {
@@ -34,143 +42,188 @@ interface Props {
 export default function SessionPage({ params, searchParams }: Props) {
   const { company, quarter } = use(params)
   const { peers: peersParam } = use(searchParams)
-
   const companyName = decodeURIComponent(company)
   const peers = peersParam ? decodeURIComponent(peersParam).split(',').filter(Boolean) : []
 
   const [targetDocs, setTargetDocs] = useState<Document[]>([])
   const [peerDocs, setPeerDocs] = useState<Document[]>([])
+  const [predictions, setPredictions] = useState<Prediction[]>([])
   const [loading, setLoading] = useState(true)
+  const [extracting, setExtracting] = useState(false)
+  const [predicting, setPredicting] = useState(false)
+  const [actionMessage, setActionMessage] = useState('')
 
-  useEffect(() => {
-    async function fetchDocs() {
-      setLoading(true)
-      try {
-        // Target company docs
-        const targetRes = await fetch(
-          `/api/documents?company=${encodeURIComponent(companyName)}&quarter=${quarter}`
-        )
-        const targetData = await targetRes.json()
-        setTargetDocs(targetData.documents ?? [])
+  async function fetchAll() {
+    setLoading(true)
+    const [targetRes, predRes] = await Promise.all([
+      fetch(`/api/documents?company=${encodeURIComponent(companyName)}&quarter=${quarter}`),
+      fetch(`/api/predictions?company=${encodeURIComponent(companyName)}&quarter=${quarter}`),
+    ])
+    const [targetData, predData] = await Promise.all([targetRes.json(), predRes.json()])
+    setTargetDocs(targetData.documents ?? [])
+    setPredictions(predData.predictions ?? [])
 
-        // Peer docs
-        if (peers.length > 0) {
-          const peerRes = await fetch(
-            `/api/documents?companies=${encodeURIComponent(peers.join(','))}&quarter=${quarter}`
-          )
-          const peerData = await peerRes.json()
-          setPeerDocs(peerData.documents ?? [])
-        }
-      } finally {
-        setLoading(false)
-      }
+    if (peers.length > 0) {
+      const peerRes = await fetch(`/api/documents?companies=${encodeURIComponent(peers.join(','))}&quarter=${quarter}`)
+      const peerData = await peerRes.json()
+      setPeerDocs(peerData.documents ?? [])
     }
-    fetchDocs()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [companyName, quarter, peersParam])
+    setLoading(false)
+  }
 
-  const targetTranscripts = targetDocs.filter(d => d.doc_type === 'transcript')
-  const targetReports = targetDocs.filter(d => d.doc_type === 'analyst_report')
-  const targetOther = targetDocs.filter(d => !['transcript', 'analyst_report'].includes(d.doc_type))
-  const peerTranscripts = peerDocs.filter(d => d.doc_type === 'transcript')
-  const peerReports = peerDocs.filter(d => d.doc_type === 'analyst_report')
+  useEffect(() => { fetchAll() }, [companyName, quarter, peersParam]) // eslint-disable-line
 
-  const totalDocs = targetDocs.length + peerDocs.length
+  async function handleExtract() {
+    const pendingDocs = [...targetDocs, ...peerDocs].filter(d =>
+      ['transcript', 'analyst_report'].includes(d.doc_type) && d.extraction_status === 'pending'
+    )
+    if (pendingDocs.length === 0) { setActionMessage('No pending documents to extract.'); return }
+
+    setExtracting(true)
+    setActionMessage(`Extracting ${pendingDocs.length} document${pendingDocs.length > 1 ? 's' : ''}…`)
+
+    const res = await fetch('/api/extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ document_ids: pendingDocs.map(d => d.id) }),
+    })
+    const data = await res.json()
+    setActionMessage(`Extraction complete — ${data.succeeded} succeeded, ${data.failed} failed.`)
+    setExtracting(false)
+    await fetchAll()
+  }
+
+  async function handlePredict() {
+    setPredicting(true)
+    setActionMessage('Generating predictions…')
+
+    const res = await fetch('/api/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ company: companyName, quarter, peers }),
+    })
+    const data = await res.json()
+    if (data.ok) {
+      setActionMessage(`${data.message} — Zone 1: ${data.counts.zone1}, Zone 2: ${data.counts.zone2}, Zone 3: ${data.counts.zone3}`)
+    } else {
+      setActionMessage(`Prediction failed: ${data.error}`)
+    }
+    setPredicting(false)
+    await fetchAll()
+  }
+
+  const pendingCount = [...targetDocs, ...peerDocs].filter(
+    d => ['transcript', 'analyst_report'].includes(d.doc_type) && d.extraction_status === 'pending'
+  ).length
+
+  const extractedCount = [...targetDocs, ...peerDocs].filter(
+    d => d.extraction_status === 'complete'
+  ).length
+
   const peerCompaniesWithDocs = [...new Set(peerDocs.map(d => d.companies?.name).filter(Boolean))]
+  const peerTranscriptCount = peerDocs.filter(d => d.doc_type === 'transcript' && d.extraction_status === 'complete').length
+
+  const zone1 = predictions.filter(p => p.zone === 1)
+  const zone2 = predictions.filter(p => p.zone === 2)
+  const zone3 = predictions.filter(p => p.zone === 3)
 
   return (
     <div className="max-w-3xl mx-auto py-10 px-4">
-
       {/* Header */}
       <div className="mb-8">
-        <Link href="/" className="text-xs text-gray-400 hover:text-gray-600 inline-block mb-3">
-          ← New session
-        </Link>
+        <Link href="/" className="text-xs text-gray-400 hover:text-gray-600 inline-block mb-3">← New session</Link>
         <h1 className="text-2xl font-bold text-gray-900">{companyName}</h1>
         <div className="flex items-center gap-3 mt-1 flex-wrap">
-          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
-            {quarter}
-          </span>
-          {peers.length > 0 && (
-            <span className="text-xs text-gray-400">Peers: {peers.join(', ')}</span>
+          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">{quarter}</span>
+          {peers.length > 0 && <span className="text-xs text-gray-400">Peers: {peers.join(', ')}</span>}
+          {peerTranscriptCount > 0 && (
+            <span className="text-xs text-gray-400">· {peerTranscriptCount} peer transcript{peerTranscriptCount > 1 ? 's' : ''} ingested</span>
           )}
         </div>
       </div>
 
       {loading ? (
-        <div className="text-sm text-gray-400 py-10 text-center">Loading corpus…</div>
-      ) : totalDocs === 0 ? (
-        /* ── No documents yet ── */
-        <div className="bg-white border border-gray-200 rounded-lg p-8 text-center">
-          <div className="text-3xl mb-3">📭</div>
-          <h2 className="text-base font-semibold text-gray-900 mb-1">No documents in corpus for {quarter}</h2>
-          <p className="text-sm text-gray-500 max-w-sm mx-auto mb-6">
-            Upload transcripts and analyst reports for {companyName}
-            {peers.length > 0 ? ` and peers (${peers.join(', ')})` : ''} to generate predictions.
-          </p>
-          <Link
-            href="/upload"
-            className="inline-flex items-center px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700"
-          >
-            Upload documents →
-          </Link>
-        </div>
+        <div className="text-sm text-gray-400 py-10 text-center">Loading…</div>
       ) : (
-        /* ── Corpus overview ── */
         <div className="space-y-6">
 
-          {/* Corpus summary bar */}
-          <div className="bg-blue-50 border border-blue-200 rounded-lg px-5 py-4 flex flex-wrap gap-6 text-sm">
-            <Stat label="Target docs" value={targetDocs.length} />
-            <Stat label="Transcripts" value={targetTranscripts.length + peerTranscripts.length} />
-            <Stat label="Analyst reports" value={targetReports.length + peerReports.length} />
-            <Stat label="Peer companies" value={peerCompaniesWithDocs.length} />
+          {/* Action bar */}
+          <div className="bg-white border border-gray-200 rounded-lg px-5 py-4">
+            <div className="flex flex-wrap gap-3 items-center">
+              <button
+                onClick={handleExtract}
+                disabled={extracting || predicting || pendingCount === 0}
+                className="px-4 py-2 bg-gray-800 text-white text-sm font-medium rounded-lg hover:bg-gray-900 disabled:opacity-40 transition-colors"
+              >
+                {extracting ? 'Extracting…' : `Extract documents${pendingCount > 0 ? ` (${pendingCount} pending)` : ''}`}
+              </button>
+              <button
+                onClick={handlePredict}
+                disabled={predicting || extracting || extractedCount === 0}
+                className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-40 transition-colors"
+              >
+                {predicting ? 'Generating predictions…' : `Generate predictions${extractedCount > 0 ? ` (${extractedCount} docs ready)` : ''}`}
+              </button>
+              <Link href="/upload" className="text-xs text-gray-400 hover:text-blue-600">+ Upload more</Link>
+            </div>
+            {actionMessage && (
+              <p className="text-xs text-gray-500 mt-2">{actionMessage}</p>
+            )}
           </div>
 
-          {/* Target company */}
-          <Section
-            title={`${companyName} — ${quarter}`}
-            badge="Target"
-            badgeColor="blue"
-            docs={targetDocs}
-            empty={`No ${quarter} documents uploaded for ${companyName} yet.`}
-            companyName={companyName}
-            quarter={quarter}
-          />
+          {/* Predictions */}
+          {predictions.length > 0 && (
+            <div className="space-y-4">
+              {[1, 2, 3].map(zone => {
+                const zonePreds = [zone1, zone2, zone3][zone - 1]
+                if (zonePreds.length === 0) return null
+                const z = ZONE_LABELS[zone]
+                return (
+                  <div key={zone} className="bg-white border border-gray-200 rounded-lg overflow-hidden">
+                    <div className={`px-5 py-3 border-b border-gray-100 flex items-center gap-2 ${
+                      zone === 1 ? 'bg-blue-50' : zone === 2 ? 'bg-amber-50' : 'bg-purple-50'
+                    }`}>
+                      <h2 className="text-sm font-semibold text-gray-900">{z.name}</h2>
+                      <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                        zone === 1 ? 'bg-blue-100 text-blue-700' : zone === 2 ? 'bg-amber-100 text-amber-700' : 'bg-purple-100 text-purple-700'
+                      }`}>{zonePreds.length}</span>
+                      <span className="text-xs text-gray-400 ml-1">{z.description}</span>
+                    </div>
+                    <div className="divide-y divide-gray-50">
+                      {zonePreds.map(p => (
+                        <PredictionCard key={p.id} prediction={p} />
+                      ))}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
 
-          {/* Peer companies */}
-          {peers.length > 0 && (
-            <Section
-              title={`Peers — ${quarter}`}
-              badge={`${peerCompaniesWithDocs.length} / ${peers.length} with docs`}
-              badgeColor="gray"
-              docs={peerDocs}
-              empty={`No ${quarter} peer documents uploaded yet.`}
+          {/* Corpus */}
+          {targetDocs.length > 0 && (
+            <CorpusSection
+              title={`${companyName} — ${quarter}`}
+              badge="Target"
+              docs={targetDocs}
+              peerDocs={peerDocs}
+              peerCompaniesWithDocs={peerCompaniesWithDocs}
               companyName={companyName}
               quarter={quarter}
-              showCompany
+              peers={peers}
             />
           )}
 
-          {/* Predictions placeholder */}
-          <div className="bg-white border border-gray-200 rounded-lg p-6 text-center">
-            <div className="text-2xl mb-2">⚙️</div>
-            <h2 className="text-sm font-semibold text-gray-900 mb-1">Extraction & prediction engine</h2>
-            <p className="text-xs text-gray-400 max-w-xs mx-auto">
-              {totalDocs} document{totalDocs > 1 ? 's' : ''} in corpus.
-              Extraction pipeline and prediction engine coming in Day 2.
-            </p>
-          </div>
-
-          {/* Add more docs */}
-          <div className="flex justify-end">
-            <Link
-              href="/upload"
-              className="text-xs text-gray-400 hover:text-blue-600"
-            >
-              + Upload more documents
-            </Link>
-          </div>
+          {targetDocs.length === 0 && predictions.length === 0 && (
+            <div className="bg-white border border-gray-200 rounded-lg p-8 text-center">
+              <div className="text-3xl mb-3">📭</div>
+              <h2 className="text-base font-semibold text-gray-900 mb-1">No documents for {quarter}</h2>
+              <p className="text-sm text-gray-500 mb-4">Upload transcripts and analyst reports to generate predictions.</p>
+              <Link href="/upload" className="inline-flex items-center px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700">
+                Upload documents →
+              </Link>
+            </div>
+          )}
 
         </div>
       )}
@@ -178,85 +231,90 @@ export default function SessionPage({ params, searchParams }: Props) {
   )
 }
 
-function Stat({ label, value }: { label: string; value: number }) {
+function PredictionCard({ prediction: p }: { prediction: Prediction }) {
+  const score = p.possibility_score ?? 0
+  const scoreColor = score >= 70 ? 'text-green-700 bg-green-50' : score >= 45 ? 'text-amber-700 bg-amber-50' : 'text-gray-600 bg-gray-50'
+
   return (
-    <div>
-      <div className="text-lg font-bold text-blue-900">{value}</div>
-      <div className="text-xs text-blue-700">{label}</div>
+    <div className="px-5 py-4">
+      <div className="flex items-start gap-3">
+        <span className={`text-sm font-bold px-2 py-0.5 rounded flex-shrink-0 ${scoreColor}`}>{score}%</span>
+        <div className="flex-1 min-w-0">
+          {p.analysts && (
+            <div className="text-xs font-medium text-gray-500 mb-0.5">
+              {p.analysts.name} · {p.analysts.firm}
+              {p.insufficient_history_flag && <span className="ml-2 text-amber-600">⚠ Insufficient history</span>}
+              {p.season_driven_flag && <span className="ml-2 text-blue-600">↑ Sector-driven</span>}
+            </div>
+          )}
+          <p className="text-sm text-gray-800">{p.predicted_question}</p>
+          {p.taxonomy_signals && (
+            <span className="inline-block mt-1 text-xs px-2 py-0.5 bg-gray-100 text-gray-600 rounded-full">
+              {p.taxonomy_signals.name}
+            </span>
+          )}
+          {p.evidence_source && (
+            <p className="text-xs text-gray-400 mt-1 truncate">{p.evidence_source}</p>
+          )}
+          <div className="flex gap-3 mt-1.5 text-xs text-gray-400">
+            <span>Signal: <strong className={p.signal_strength === 'high' ? 'text-green-600' : p.signal_strength === 'medium' ? 'text-amber-600' : 'text-gray-500'}>{p.signal_strength}</strong></span>
+            <span>Pattern: {p.analyst_pattern_score}%</span>
+            <span>Season: {p.season_corroboration_score}%</span>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
 
-function Section({
-  title, badge, badgeColor, docs, empty, companyName, quarter, showCompany = false,
-}: {
-  title: string
-  badge: string
-  badgeColor: 'blue' | 'gray'
-  docs: Document[]
-  empty: string
-  companyName: string
-  quarter: string
-  showCompany?: boolean
+function CorpusSection({ title, badge, docs, peerDocs, peerCompaniesWithDocs, companyName, quarter, peers }: {
+  title: string; badge: string; docs: Document[]; peerDocs: Document[]
+  peerCompaniesWithDocs: string[]; companyName: string; quarter: string; peers: string[]
 }) {
-  const badgeClass = badgeColor === 'blue'
-    ? 'bg-blue-100 text-blue-700'
-    : 'bg-gray-100 text-gray-600'
+  const [expanded, setExpanded] = useState(false)
+  const totalDocs = docs.length + peerDocs.length
 
   return (
     <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
-      <div className="px-5 py-3 border-b border-gray-100 flex items-center gap-2">
-        <h2 className="text-sm font-semibold text-gray-900">{title}</h2>
-        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${badgeClass}`}>{badge}</span>
-      </div>
-      {docs.length === 0 ? (
-        <div className="px-5 py-6 text-center">
-          <p className="text-sm text-gray-400">{empty}</p>
-          <Link
-            href={`/upload`}
-            className="text-xs text-blue-500 hover:text-blue-700 mt-1 inline-block"
-          >
-            Upload for {companyName} {quarter}
-          </Link>
+      <button
+        onClick={() => setExpanded(e => !e)}
+        className="w-full px-5 py-3 border-b border-gray-100 flex items-center justify-between hover:bg-gray-50"
+      >
+        <div className="flex items-center gap-2">
+          <h2 className="text-sm font-semibold text-gray-900">Corpus</h2>
+          <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-gray-100 text-gray-600">{totalDocs} docs</span>
+          {peers.length > 0 && (
+            <span className="text-xs text-gray-400">{peerCompaniesWithDocs.length}/{peers.length} peers with docs</span>
+          )}
         </div>
-      ) : (
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="bg-gray-50 border-b border-gray-100">
-              {showCompany && <th className="text-left px-5 py-2 text-xs font-medium text-gray-500">Company</th>}
-              <th className="text-left px-5 py-2 text-xs font-medium text-gray-500">File</th>
-              <th className="text-left px-5 py-2 text-xs font-medium text-gray-500">Type</th>
-              <th className="text-left px-5 py-2 text-xs font-medium text-gray-500">Source</th>
-              <th className="text-left px-5 py-2 text-xs font-medium text-gray-500">Status</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-50">
-            {docs.map(doc => (
-              <tr key={doc.id} className="hover:bg-gray-50">
-                {showCompany && (
-                  <td className="px-5 py-2.5 text-xs font-medium text-gray-700">{doc.companies?.name}</td>
-                )}
-                <td className="px-5 py-2.5 max-w-[200px]">
-                  <span className="text-xs text-gray-700 truncate block" title={doc.file_name}>
-                    {doc.file_name ?? '—'}
-                  </span>
-                  {doc.analyst_firm && (
-                    <span className="text-xs text-gray-400">{doc.analyst_firm}{doc.analyst_name ? ` · ${doc.analyst_name}` : ''}</span>
-                  )}
-                </td>
-                <td className="px-5 py-2.5">
-                  <span className="text-xs text-gray-600">{DOC_TYPE_LABELS[doc.doc_type] ?? doc.doc_type}</span>
-                </td>
-                <td className="px-5 py-2.5">
-                  <span className="text-xs text-gray-400 capitalize">{doc.source?.replace('_', ' ')}</span>
-                </td>
-                <td className="px-5 py-2.5">
-                  <StatusBadge status={doc.extraction_status} />
-                </td>
+        <span className="text-xs text-gray-400">{expanded ? '▲ Hide' : '▼ Show'}</span>
+      </button>
+      {expanded && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-100">
+                <th className="text-left px-5 py-2 text-xs font-medium text-gray-500">Company</th>
+                <th className="text-left px-5 py-2 text-xs font-medium text-gray-500">File</th>
+                <th className="text-left px-5 py-2 text-xs font-medium text-gray-500">Type</th>
+                <th className="text-left px-5 py-2 text-xs font-medium text-gray-500">Status</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {[...docs, ...peerDocs].map(doc => (
+                <tr key={doc.id} className="hover:bg-gray-50">
+                  <td className="px-5 py-2.5 text-xs font-medium text-gray-700">{doc.companies?.name}</td>
+                  <td className="px-5 py-2.5 max-w-[200px]">
+                    <span className="text-xs text-gray-700 truncate block" title={doc.file_name}>{doc.file_name}</span>
+                    {doc.analyst_firm && <span className="text-xs text-gray-400">{doc.analyst_firm}</span>}
+                  </td>
+                  <td className="px-5 py-2.5 text-xs text-gray-600">{DOC_TYPE_LABELS[doc.doc_type] ?? doc.doc_type}</td>
+                  <td className="px-5 py-2.5"><StatusBadge status={doc.extraction_status} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   )
@@ -270,7 +328,5 @@ function StatusBadge({ status }: { status: string }) {
     failed:     { label: 'Failed',     className: 'bg-red-50 text-red-700' },
   }
   const s = map[status] ?? { label: status, className: 'bg-gray-50 text-gray-500' }
-  return (
-    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${s.className}`}>{s.label}</span>
-  )
+  return <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${s.className}`}>{s.label}</span>
 }
