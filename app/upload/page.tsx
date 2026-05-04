@@ -13,14 +13,12 @@ const DOC_TYPE_LABELS: Record<string, string> = {
 
 const DOC_TYPES = Object.keys(DOC_TYPE_LABELS)
 
-const COMPANIES = [
-  'TCS', 'Infosys', 'Wipro', 'HCL Technologies', 'Tech Mahindra',
-  'LTIMindtree', 'Mphasis', 'Coforge', 'Persistent Systems', 'KPIT Technologies',
-]
+type RowStatus = 'pending' | 'classifying' | 'ready' | 'uploading' | 'extracting' | 'done' | 'error'
 
 interface FileRow {
   file: File
-  status: 'pending' | 'extracting' | 'ready' | 'uploading' | 'done' | 'error'
+  status: RowStatus
+  company: string
   quarter: string
   doc_type: string
   analyst_firm: string
@@ -29,289 +27,263 @@ interface FileRow {
 }
 
 export default function UploadPage() {
-  const [company, setCompany] = useState('')
-  const [customCompany, setCustomCompany] = useState('')
   const [rows, setRows] = useState<FileRow[]>([])
   const [dragging, setDragging] = useState(false)
-  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'done'>('idle')
   const fileInputRef = useRef<HTMLInputElement>(null)
-
-  const effectiveCompany = company === '__custom__' ? customCompany : company
 
   function addFiles(files: File[]) {
     const pdfs = files.filter(f => f.type === 'application/pdf' || f.name.endsWith('.pdf'))
-    const newRows: FileRow[] = pdfs.map(f => ({
-      file: f,
-      status: 'pending',
-      quarter: '',
-      doc_type: '',
-      analyst_firm: '',
-      analyst_name: '',
-    }))
-    setRows(prev => [...prev, ...newRows])
+    setRows(prev => [
+      ...prev,
+      ...pdfs.map(f => ({
+        file: f, status: 'pending' as RowStatus,
+        company: '', quarter: '', doc_type: '', analyst_firm: '', analyst_name: '',
+      })),
+    ])
   }
 
-  function handleDrop(e: React.DragEvent) {
-    e.preventDefault()
-    setDragging(false)
-    addFiles(Array.from(e.dataTransfer.files))
+  function updateRow(i: number, patch: Partial<FileRow>) {
+    setRows(prev => prev.map((r, idx) => idx === i ? { ...r, ...patch } : r))
   }
 
-  function updateRow(index: number, patch: Partial<FileRow>) {
-    setRows(prev => prev.map((r, i) => i === index ? { ...r, ...patch } : r))
+  function removeRow(i: number) {
+    setRows(prev => prev.filter((_, idx) => idx !== i))
   }
 
-  function removeRow(index: number) {
-    setRows(prev => prev.filter((_, i) => i !== index))
-  }
-
-  async function extractAll() {
-    const pending = rows.map((r, i) => ({ row: r, i })).filter(({ row }) => row.status === 'pending')
-    await Promise.all(pending.map(async ({ row, i }) => {
-      updateRow(i, { status: 'extracting' })
+  async function classifyAll() {
+    const pending = rows.map((r, i) => ({ r, i })).filter(({ r }) => r.status === 'pending')
+    await Promise.all(pending.map(async ({ r, i }) => {
+      updateRow(i, { status: 'classifying' })
       try {
         const fd = new FormData()
-        fd.append('file', row.file)
+        fd.append('file', r.file)
         const res = await fetch('/api/extract-metadata', { method: 'POST', body: fd })
         const data = await res.json()
         if (data.error) throw new Error(data.error)
         updateRow(i, {
           status: 'ready',
+          company: data.company ?? '',
           quarter: data.quarter ?? '',
           doc_type: data.doc_type ?? '',
           analyst_firm: data.analyst_firm ?? '',
           analyst_name: data.analyst_name ?? '',
         })
       } catch (err) {
-        updateRow(i, { status: 'error', error: err instanceof Error ? err.message : 'Extraction failed' })
+        updateRow(i, {
+          status: 'ready', // still go to ready so user can fix manually
+          error: err instanceof Error ? err.message : 'Classification failed',
+        })
       }
     }))
   }
 
-  async function uploadAll() {
-    const ready = rows.filter(r => r.status === 'ready')
-    if (!effectiveCompany || ready.length === 0) return
-    setUploadStatus('uploading')
+  async function processAll() {
+    const ready = rows.map((r, i) => ({ r, i })).filter(({ r }) => r.status === 'ready' && r.company && r.quarter)
 
-    await Promise.all(rows.map(async (row, i) => {
-      if (row.status !== 'ready') return
+    // Process sequentially to avoid overwhelming the API
+    for (const { r, i } of ready) {
+      // Step 1: Upload
       updateRow(i, { status: 'uploading' })
       try {
         const fd = new FormData()
-        fd.append('file', row.file)
-        fd.append('company_name', effectiveCompany)
-        fd.append('doc_type', row.doc_type || 'other')
-        fd.append('quarter', row.quarter)
-        if (row.analyst_firm) fd.append('analyst_firm', row.analyst_firm)
-        if (row.analyst_name) fd.append('analyst_name', row.analyst_name)
+        fd.append('file', r.file)
+        fd.append('company_name', r.company)
+        fd.append('doc_type', r.doc_type || 'other')
+        fd.append('quarter', r.quarter)
+        if (r.analyst_firm) fd.append('analyst_firm', r.analyst_firm)
+        if (r.analyst_name) fd.append('analyst_name', r.analyst_name)
 
-        const res = await fetch('/api/upload', { method: 'POST', body: fd })
-        const data = await res.json()
-        if (!res.ok) throw new Error(data.error)
-        updateRow(i, { status: 'done' })
+        const uploadRes = await fetch('/api/upload', { method: 'POST', body: fd })
+        const uploadData = await uploadRes.json()
+        if (!uploadRes.ok) throw new Error(uploadData.error)
+
+        const documentId = uploadData.document?.id
+        if (!documentId) throw new Error('No document ID returned')
+
+        // Step 2: Extract (only for transcripts and analyst reports)
+        if (['transcript', 'analyst_report'].includes(r.doc_type)) {
+          updateRow(i, { status: 'extracting' })
+          const extractRes = await fetch('/api/extract', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ document_ids: [documentId] }),
+          })
+          const extractData = await extractRes.json()
+          if (extractData.failed > 0) {
+            const failedResult = extractData.results?.find((r: { ok: boolean }) => !r.ok)
+            throw new Error(failedResult?.message ?? 'Extraction failed')
+          }
+        }
+
+        updateRow(i, { status: 'done', error: undefined })
       } catch (err) {
-        updateRow(i, { status: 'error', error: err instanceof Error ? err.message : 'Upload failed' })
+        updateRow(i, { status: 'error', error: err instanceof Error ? err.message : 'Failed' })
       }
-    }))
-    setUploadStatus('done')
+    }
   }
 
   const hasPending = rows.some(r => r.status === 'pending')
-  const hasReady = rows.some(r => r.status === 'ready')
+  const hasReady = rows.some(r => r.status === 'ready' && r.company && r.quarter)
+  const isProcessing = rows.some(r => r.status === 'uploading' || r.status === 'extracting' || r.status === 'classifying')
   const allDone = rows.length > 0 && rows.every(r => r.status === 'done' || r.status === 'error')
+  const readyCount = rows.filter(r => r.status === 'ready' && r.company && r.quarter).length
 
   return (
-    <div className="max-w-4xl mx-auto py-10 px-4">
+    <div className="max-w-5xl mx-auto py-10 px-4">
       <div className="mb-8">
-        <h1 className="text-2xl font-bold text-gray-900 mb-1">Batch Upload</h1>
+        <h1 className="text-2xl font-bold text-gray-900 mb-1">Upload Documents</h1>
         <p className="text-sm text-gray-500">
-          Drop multiple PDFs — quarter, document type, and analyst details are extracted automatically.
+          Drop any mix of transcripts, analyst reports, or results documents across any companies.
+          The AI classifies each file automatically — review, correct if needed, then process.
         </p>
-      </div>
-
-      {/* Company selector */}
-      <div className="mb-6 flex gap-3 items-end">
-        <div className="flex-1">
-          <label className="block text-sm font-medium text-gray-700 mb-1">
-            Company <span className="text-red-400">*</span>
-          </label>
-          <select
-            value={company}
-            onChange={e => setCompany(e.target.value)}
-            className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="">Select company…</option>
-            {COMPANIES.map(c => <option key={c} value={c}>{c}</option>)}
-            <option value="__custom__">Other — type below</option>
-          </select>
-        </div>
-        {company === '__custom__' && (
-          <div className="flex-1">
-            <label className="block text-sm font-medium text-gray-700 mb-1">Company name</label>
-            <input
-              type="text"
-              value={customCompany}
-              onChange={e => setCustomCompany(e.target.value)}
-              placeholder="Enter company name"
-              className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
-          </div>
-        )}
       </div>
 
       {/* Drop zone */}
       <div
         onDragOver={e => { e.preventDefault(); setDragging(true) }}
         onDragLeave={() => setDragging(false)}
-        onDrop={handleDrop}
+        onDrop={e => { e.preventDefault(); setDragging(false); addFiles(Array.from(e.dataTransfer.files)) }}
         onClick={() => fileInputRef.current?.click()}
-        className={`border-2 border-dashed rounded-lg p-10 text-center cursor-pointer transition-colors mb-6 ${
+        className={`border-2 border-dashed rounded-xl p-12 text-center cursor-pointer transition-colors mb-6 ${
           dragging ? 'border-blue-400 bg-blue-50' : 'border-gray-300 hover:border-blue-400 hover:bg-gray-50'
         }`}
       >
-        <div className="text-3xl mb-2">📂</div>
+        <div className="text-4xl mb-3">📂</div>
         <p className="text-sm font-medium text-gray-700">Drop PDFs here or click to browse</p>
-        <p className="text-xs text-gray-400 mt-1">Multiple files supported</p>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".pdf"
-          multiple
-          className="hidden"
-          onChange={e => addFiles(Array.from(e.target.files ?? []))}
-        />
+        <p className="text-xs text-gray-400 mt-1">Any company · Any quarter · Multiple files</p>
+        <input ref={fileInputRef} type="file" accept=".pdf" multiple className="hidden"
+          onChange={e => addFiles(Array.from(e.target.files ?? []))} />
       </div>
 
       {/* File table */}
       {rows.length > 0 && (
-        <div className="mb-6">
-          <div className="overflow-x-auto rounded-lg border border-gray-200">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="bg-gray-50 border-b border-gray-200">
-                  <th className="text-left px-4 py-2.5 font-medium text-gray-600 text-xs">File</th>
-                  <th className="text-left px-4 py-2.5 font-medium text-gray-600 text-xs">Quarter</th>
-                  <th className="text-left px-4 py-2.5 font-medium text-gray-600 text-xs">Type</th>
-                  <th className="text-left px-4 py-2.5 font-medium text-gray-600 text-xs">Analyst firm</th>
-                  <th className="text-left px-4 py-2.5 font-medium text-gray-600 text-xs">Analyst name</th>
-                  <th className="text-left px-4 py-2.5 font-medium text-gray-600 text-xs">Status</th>
-                  <th className="px-4 py-2.5" />
+        <div className="mb-5 rounded-xl border border-gray-200 overflow-hidden">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-200 text-xs font-medium text-gray-500">
+                <th className="text-left px-4 py-3">File</th>
+                <th className="text-left px-4 py-3">Company</th>
+                <th className="text-left px-4 py-3">Quarter</th>
+                <th className="text-left px-4 py-3">Type</th>
+                <th className="text-left px-4 py-3">Analyst firm</th>
+                <th className="text-left px-4 py-3">Status</th>
+                <th className="px-4 py-3 w-6" />
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {rows.map((row, i) => (
+                <tr key={i} className={
+                  row.status === 'done' ? 'bg-green-50' :
+                  row.status === 'error' ? 'bg-red-50' :
+                  row.status === 'extracting' || row.status === 'uploading' ? 'bg-blue-50' : 'bg-white'
+                }>
+                  <td className="px-4 py-3 max-w-[180px]">
+                    <span className="truncate block text-xs text-gray-700 font-medium" title={row.file.name}>
+                      {row.file.name}
+                    </span>
+                    {row.error && <span className="text-xs text-red-500 block mt-0.5 truncate" title={row.error}>{row.error}</span>}
+                  </td>
+
+                  {/* Company */}
+                  <td className="px-4 py-3">
+                    {row.status === 'ready' ? (
+                      <input value={row.company} onChange={e => updateRow(i, { company: e.target.value })}
+                        placeholder="Company"
+                        className="w-32 border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400" />
+                    ) : (
+                      <span className="text-xs text-gray-700">{row.company || '—'}</span>
+                    )}
+                  </td>
+
+                  {/* Quarter */}
+                  <td className="px-4 py-3">
+                    {row.status === 'ready' ? (
+                      <input value={row.quarter} onChange={e => updateRow(i, { quarter: e.target.value })}
+                        placeholder="Q4FY26"
+                        className="w-20 border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400" />
+                    ) : (
+                      <span className="text-xs text-gray-700">{row.quarter || '—'}</span>
+                    )}
+                  </td>
+
+                  {/* Doc type */}
+                  <td className="px-4 py-3">
+                    {row.status === 'ready' ? (
+                      <select value={row.doc_type} onChange={e => updateRow(i, { doc_type: e.target.value })}
+                        className="border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400">
+                        <option value="">Select…</option>
+                        {DOC_TYPES.map(t => <option key={t} value={t}>{DOC_TYPE_LABELS[t]}</option>)}
+                      </select>
+                    ) : (
+                      <span className="text-xs text-gray-700">{DOC_TYPE_LABELS[row.doc_type] || '—'}</span>
+                    )}
+                  </td>
+
+                  {/* Analyst firm */}
+                  <td className="px-4 py-3">
+                    {row.status === 'ready' ? (
+                      <input value={row.analyst_firm} onChange={e => updateRow(i, { analyst_firm: e.target.value })}
+                        placeholder="Firm (optional)"
+                        className="w-28 border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400" />
+                    ) : (
+                      <span className="text-xs text-gray-500">{row.analyst_firm || '—'}</span>
+                    )}
+                  </td>
+
+                  {/* Status */}
+                  <td className="px-4 py-3 whitespace-nowrap">
+                    {row.status === 'pending'     && <span className="text-xs text-gray-400">Pending</span>}
+                    {row.status === 'classifying' && <span className="text-xs text-blue-500 animate-pulse">Classifying…</span>}
+                    {row.status === 'ready'       && <span className="text-xs text-amber-600 font-medium">Review</span>}
+                    {row.status === 'uploading'   && <span className="text-xs text-blue-500 animate-pulse">Uploading…</span>}
+                    {row.status === 'extracting'  && <span className="text-xs text-blue-600 animate-pulse font-medium">Extracting…</span>}
+                    {row.status === 'done'        && <span className="text-xs text-green-700 font-medium">✓ Done</span>}
+                    {row.status === 'error'       && <span className="text-xs text-red-600 font-medium">✕ Error</span>}
+                  </td>
+
+                  <td className="px-4 py-3">
+                    {!['done', 'uploading', 'extracting', 'classifying'].includes(row.status) && (
+                      <button onClick={() => removeRow(i)} className="text-gray-300 hover:text-red-400 text-xs">✕</button>
+                    )}
+                  </td>
                 </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                {rows.map((row, i) => (
-                  <tr key={i} className={row.status === 'done' ? 'bg-green-50' : row.status === 'error' ? 'bg-red-50' : 'bg-white'}>
-                    <td className="px-4 py-2.5 max-w-[180px]">
-                      <span className="truncate block text-xs text-gray-700" title={row.file.name}>
-                        {row.file.name}
-                      </span>
-                    </td>
-                    <td className="px-4 py-2.5">
-                      {row.status === 'ready' || row.status === 'error' ? (
-                        <input
-                          value={row.quarter}
-                          onChange={e => updateRow(i, { quarter: e.target.value })}
-                          placeholder="Q4FY26"
-                          className="w-20 border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
-                        />
-                      ) : (
-                        <span className="text-xs text-gray-500">{row.quarter || '—'}</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2.5">
-                      {row.status === 'ready' || row.status === 'error' ? (
-                        <select
-                          value={row.doc_type}
-                          onChange={e => updateRow(i, { doc_type: e.target.value })}
-                          className="border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
-                        >
-                          <option value="">Select…</option>
-                          {DOC_TYPES.map(t => <option key={t} value={t}>{DOC_TYPE_LABELS[t]}</option>)}
-                        </select>
-                      ) : (
-                        <span className="text-xs text-gray-500">{DOC_TYPE_LABELS[row.doc_type] || '—'}</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2.5">
-                      {row.status === 'ready' ? (
-                        <input
-                          value={row.analyst_firm}
-                          onChange={e => updateRow(i, { analyst_firm: e.target.value })}
-                          placeholder="Firm"
-                          className="w-28 border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
-                        />
-                      ) : (
-                        <span className="text-xs text-gray-500">{row.analyst_firm || '—'}</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2.5">
-                      {row.status === 'ready' ? (
-                        <input
-                          value={row.analyst_name}
-                          onChange={e => updateRow(i, { analyst_name: e.target.value })}
-                          placeholder="Name"
-                          className="w-28 border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
-                        />
-                      ) : (
-                        <span className="text-xs text-gray-500">{row.analyst_name || '—'}</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2.5">
-                      {row.status === 'pending' && <span className="text-xs text-gray-400">Pending</span>}
-                      {row.status === 'extracting' && <span className="text-xs text-blue-500 animate-pulse">Extracting…</span>}
-                      {row.status === 'ready' && <span className="text-xs text-green-600 font-medium">✓ Ready</span>}
-                      {row.status === 'uploading' && <span className="text-xs text-blue-500 animate-pulse">Uploading…</span>}
-                      {row.status === 'done' && <span className="text-xs text-green-700 font-medium">✓ Uploaded</span>}
-                      {row.status === 'error' && (
-                        <span className="text-xs text-red-600" title={row.error}>✕ Error</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2.5">
-                      {row.status !== 'done' && row.status !== 'uploading' && (
-                        <button onClick={() => removeRow(i)} className="text-gray-300 hover:text-red-400 text-xs">✕</button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
 
-      {/* Action buttons */}
+      {/* Actions */}
       {rows.length > 0 && !allDone && (
-        <div className="flex gap-3">
-          {hasPending && (
-            <button
-              onClick={extractAll}
-              disabled={!effectiveCompany}
-              className="px-5 py-2.5 bg-gray-800 text-white text-sm font-medium rounded-lg hover:bg-gray-900 disabled:opacity-40 transition-colors"
-            >
-              Extract metadata from {rows.filter(r => r.status === 'pending').length} file{rows.filter(r => r.status === 'pending').length > 1 ? 's' : ''}
+        <div className="flex gap-3 items-center">
+          {hasPending && !isProcessing && (
+            <button onClick={classifyAll}
+              className="px-5 py-2.5 bg-gray-800 text-white text-sm font-medium rounded-lg hover:bg-gray-900 transition-colors">
+              Classify {rows.filter(r => r.status === 'pending').length} file{rows.filter(r => r.status === 'pending').length > 1 ? 's' : ''}
             </button>
           )}
-          {hasReady && (
-            <button
-              onClick={uploadAll}
-              disabled={!effectiveCompany || uploadStatus === 'uploading'}
-              className="px-5 py-2.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-40 transition-colors"
-            >
-              Upload {rows.filter(r => r.status === 'ready').length} file{rows.filter(r => r.status === 'ready').length > 1 ? 's' : ''} →
+          {hasReady && !isProcessing && (
+            <button onClick={processAll}
+              className="px-5 py-2.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors">
+              Upload &amp; extract {readyCount} file{readyCount > 1 ? 's' : ''} →
             </button>
           )}
+          {isProcessing && (
+            <span className="text-sm text-gray-500 animate-pulse">Processing…</span>
+          )}
+          <p className="text-xs text-gray-400">
+            Transcripts and analyst reports are fully extracted during upload.
+          </p>
         </div>
       )}
 
       {allDone && (
-        <div className="mt-4 p-4 bg-green-50 border border-green-200 rounded-lg text-sm text-green-800">
-          ✓ All files uploaded successfully. They are queued for extraction.
-          <button
-            onClick={() => { setRows([]); setUploadStatus('idle') }}
-            className="ml-3 underline text-green-700 hover:text-green-900"
-          >
-            Upload more
-          </button>
+        <div className="p-4 bg-green-50 border border-green-200 rounded-xl text-sm text-green-800 flex items-center justify-between">
+          <span>✓ All files uploaded and extracted. Ready for predictions.</span>
+          <div className="flex gap-3">
+            <a href="/" className="text-green-700 underline hover:text-green-900 text-xs">Start session →</a>
+            <button onClick={() => setRows([])} className="text-green-600 underline hover:text-green-900 text-xs">Upload more</button>
+          </div>
         </div>
       )}
     </div>

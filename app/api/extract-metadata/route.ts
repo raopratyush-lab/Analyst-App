@@ -1,34 +1,36 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getAnthropicClient, DEFAULT_MODEL } from '@/lib/anthropic'
 import * as pdfParseModule from 'pdf-parse'
-// pdf-parse ships CommonJS; handle both default and named export
 const pdfParse: (buf: Buffer, opts?: { max?: number }) => Promise<{ text: string }> =
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (pdfParseModule as any).default ?? pdfParseModule
 
-// Normalise a 4-digit year like 2026 → "26"
+const KNOWN_COMPANIES = [
+  'TCS', 'Tata Consultancy Services',
+  'Infosys',
+  'Wipro',
+  'HCL Technologies', 'HCLTech',
+  'Tech Mahindra',
+  'LTIMindtree', 'LTI Mindtree',
+  'Mphasis',
+  'Coforge',
+  'Persistent Systems',
+  'KPIT Technologies', 'KPIT',
+]
+
 function shortYear(y: string): string {
   return y.length === 4 ? y.slice(-2) : y
 }
 
-// Attempt to extract quarter from filename — handles multiple formats
 function quarterFromFilename(name: string): string | null {
-  // Q4FY26, Q4FY2026, q4fy26
   const m1 = name.match(/[Qq]([1-4])\s*[Ff][Yy]\s*(\d{2,4})/i)
   if (m1) return `Q${m1[1]}FY${shortYear(m1[2])}`
-
-  // Q4 2025-26, Q4 2025/26
   const m2 = name.match(/[Qq]([1-4])\s+(\d{4})[-/](\d{2,4})/i)
   if (m2) return `Q${m2[1]}FY${shortYear(m2[3])}`
-
-  // Q4 2026
   const m3 = name.match(/[Qq]([1-4])\s+(\d{4})/i)
   if (m3) return `Q${m3[1]}FY${shortYear(m3[2])}`
-
-  // FY26 Q4 or FY2026 Q4
   const m4 = name.match(/[Ff][Yy](\d{2,4})\s*[Qq]([1-4])/i)
   if (m4) return `Q${m4[2]}FY${shortYear(m4[1])}`
-
   return null
 }
 
@@ -42,6 +44,26 @@ function docTypeFromFilename(name: string): string | null {
   return null
 }
 
+function companyFromFilename(name: string): string | null {
+  const lower = name.toLowerCase()
+  const map: Record<string, string> = {
+    'tcs': 'TCS', 'tata consultancy': 'TCS',
+    'infosys': 'Infosys',
+    'wipro': 'Wipro',
+    'hcl': 'HCL Technologies', 'hcltech': 'HCL Technologies',
+    'tech mahindra': 'Tech Mahindra', 'techmahindra': 'Tech Mahindra',
+    'ltimindtree': 'LTIMindtree', 'lti mindtree': 'LTIMindtree', 'lti': 'LTIMindtree',
+    'mphasis': 'Mphasis',
+    'coforge': 'Coforge',
+    'persistent': 'Persistent Systems',
+    'kpit': 'KPIT Technologies',
+  }
+  for (const [key, val] of Object.entries(map)) {
+    if (lower.includes(key)) return val
+  }
+  return null
+}
+
 export async function POST(req: NextRequest) {
   const formData = await req.formData()
   const file = formData.get('file') as File | null
@@ -49,11 +71,12 @@ export async function POST(req: NextRequest) {
 
   const filename = file.name
 
-  // --- Step 1: filename heuristics (free, instant) ---
+  // Step 1: filename heuristics
   const quarterHint = quarterFromFilename(filename)
   const docTypeHint = docTypeFromFilename(filename)
+  const companyHint = companyFromFilename(filename)
 
-  // --- Step 2: extract first 2 pages of PDF text ---
+  // Step 2: extract first 2 pages of PDF text
   const buffer = Buffer.from(await file.arrayBuffer())
   let firstPageText = ''
   try {
@@ -64,8 +87,9 @@ export async function POST(req: NextRequest) {
   }
 
   // If filename gave us everything, skip the API call
-  if (quarterHint && docTypeHint && docTypeHint !== 'other') {
+  if (quarterHint && docTypeHint && companyHint && docTypeHint !== 'other') {
     return NextResponse.json({
+      company: companyHint,
       quarter: quarterHint,
       fiscal_year: `FY${quarterHint.match(/FY(\d+)/)?.[1] ?? ''}`,
       doc_type: docTypeHint,
@@ -75,7 +99,7 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // --- Step 3: ask Claude for anything we couldn't get from the filename ---
+  // Step 3: Claude extracts everything we couldn't get from filename
   try {
     const prompt = `You are extracting metadata from an Indian IT sector earnings document.
 
@@ -85,11 +109,15 @@ First pages text:
 ${firstPageText || '(PDF text extraction failed — use filename only)'}
 """
 
-${quarterHint ? `Quarter already identified: ${quarterHint}` : ''}
-${docTypeHint ? `Document type already identified: ${docTypeHint}` : ''}
+${companyHint ? `Company already identified from filename: ${companyHint}` : ''}
+${quarterHint ? `Quarter already identified from filename: ${quarterHint}` : ''}
+${docTypeHint ? `Document type already identified from filename: ${docTypeHint}` : ''}
 
-Return valid JSON only, no markdown, no explanation:
+Known Indian IT companies: ${KNOWN_COMPANIES.join(', ')}
+
+Return valid JSON only, no markdown:
 {
+  "company": "Exact company name from the known list above, or best match",
   "quarter": "Q4FY26",
   "fiscal_year": "FY26",
   "doc_type": "transcript" | "analyst_report" | "press_release" | "investor_presentation" | "results_announcement" | "other",
@@ -98,11 +126,10 @@ Return valid JSON only, no markdown, no explanation:
 }
 
 Rules:
-- quarter format: Q[1-4]FY[2-digit-year] — e.g. Q4FY26, Q1FY25
-- "Q4 2025-26" and "Q4 FY2026" both map to Q4FY26
-- doc_type "transcript" = earnings call / concall transcript
+- company: use the canonical name from the known list (e.g. "TCS" not "Tata Consultancy Services")
+- quarter: Q[1-4]FY[2-digit-year] — "Q4 2025-26" maps to Q4FY26
 - analyst_firm and analyst_name only for analyst_report, otherwise null
-- Use null for any field you cannot determine with confidence`
+- null for any field you cannot determine with confidence`
 
     const message = await getAnthropicClient().messages.create({
       model: DEFAULT_MODEL,
@@ -116,9 +143,10 @@ Rules:
 
     return NextResponse.json({ ...extracted, source: 'claude' })
   } catch (err) {
-    console.error('[extract-metadata] Claude step failed:', err)
-    // Never hard-error — return best-effort from filename so row goes to Ready
+    console.error('[extract-metadata]', err)
+    // Best-effort fallback — never hard-error
     return NextResponse.json({
+      company: companyHint ?? '',
       quarter: quarterHint ?? '',
       fiscal_year: quarterHint ? `FY${quarterHint.match(/FY(\d+)/)?.[1] ?? ''}` : '',
       doc_type: docTypeHint ?? '',

@@ -49,7 +49,6 @@ export default function SessionPage({ params, searchParams }: Props) {
   const [peerDocs, setPeerDocs] = useState<Document[]>([])
   const [predictions, setPredictions] = useState<Prediction[]>([])
   const [loading, setLoading] = useState(true)
-  const [extracting, setExtracting] = useState(false)
   const [predicting, setPredicting] = useState(false)
   const [actionMessage, setActionMessage] = useState('')
 
@@ -73,26 +72,6 @@ export default function SessionPage({ params, searchParams }: Props) {
 
   useEffect(() => { fetchAll() }, [companyName, quarter, peersParam]) // eslint-disable-line
 
-  async function handleExtract() {
-    const pendingDocs = [...targetDocs, ...peerDocs].filter(d =>
-      ['transcript', 'analyst_report'].includes(d.doc_type) && d.extraction_status === 'pending'
-    )
-    if (pendingDocs.length === 0) { setActionMessage('No pending documents to extract.'); return }
-
-    setExtracting(true)
-    setActionMessage(`Extracting ${pendingDocs.length} document${pendingDocs.length > 1 ? 's' : ''}…`)
-
-    const res = await fetch('/api/extract', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ document_ids: pendingDocs.map(d => d.id) }),
-    })
-    const data = await res.json()
-    setActionMessage(`Extraction complete — ${data.succeeded} succeeded, ${data.failed} failed.`)
-    setExtracting(false)
-    await fetchAll()
-  }
-
   async function handlePredict() {
     setPredicting(true)
     setActionMessage('Generating predictions…')
@@ -111,10 +90,6 @@ export default function SessionPage({ params, searchParams }: Props) {
     setPredicting(false)
     await fetchAll()
   }
-
-  const pendingCount = [...targetDocs, ...peerDocs].filter(
-    d => ['transcript', 'analyst_report'].includes(d.doc_type) && d.extraction_status === 'pending'
-  ).length
 
   const extractedCount = [...targetDocs, ...peerDocs].filter(
     d => d.extraction_status === 'complete'
@@ -151,15 +126,8 @@ export default function SessionPage({ params, searchParams }: Props) {
           <div className="bg-white border border-gray-200 rounded-lg px-5 py-4">
             <div className="flex flex-wrap gap-3 items-center">
               <button
-                onClick={handleExtract}
-                disabled={extracting || predicting || pendingCount === 0}
-                className="px-4 py-2 bg-gray-800 text-white text-sm font-medium rounded-lg hover:bg-gray-900 disabled:opacity-40 transition-colors"
-              >
-                {extracting ? 'Extracting…' : `Extract documents${pendingCount > 0 ? ` (${pendingCount} pending)` : ''}`}
-              </button>
-              <button
                 onClick={handlePredict}
-                disabled={predicting || extracting || extractedCount === 0}
+                disabled={predicting || extractedCount === 0}
                 className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-40 transition-colors"
               >
                 {predicting ? 'Generating predictions…' : `Generate predictions${extractedCount > 0 ? ` (${extractedCount} docs ready)` : ''}`}
