@@ -2,106 +2,70 @@
 
 import { useState, useRef } from 'react'
 
-const DOC_TYPE_LABELS: Record<string, string> = {
-  transcript: 'Transcript',
-  analyst_report: 'Analyst Report',
-  press_release: 'Press Release',
-  investor_presentation: 'Investor Presentation',
-  results_announcement: 'Results Announcement',
-  other: 'Other',
-}
-
-const DOC_TYPES = Object.keys(DOC_TYPE_LABELS)
-
-type RowStatus = 'pending' | 'classifying' | 'ready' | 'uploading' | 'extracting' | 'done' | 'error'
+type RowStatus = 'queued' | 'uploading' | 'extracting' | 'done' | 'error'
 
 interface FileRow {
   file: File
   status: RowStatus
-  company: string
-  quarter: string
-  doc_type: string
-  analyst_firm: string
-  analyst_name: string
   error?: string
 }
 
 export default function UploadPage() {
   const [rows, setRows] = useState<FileRow[]>([])
   const [dragging, setDragging] = useState(false)
+  const [running, setRunning] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   function addFiles(files: File[]) {
     const pdfs = files.filter(f => f.type === 'application/pdf' || f.name.endsWith('.pdf'))
     setRows(prev => [
       ...prev,
-      ...pdfs.map(f => ({
-        file: f, status: 'pending' as RowStatus,
-        company: '', quarter: '', doc_type: '', analyst_firm: '', analyst_name: '',
-      })),
+      ...pdfs
+        .filter(f => !prev.some(r => r.file.name === f.name && r.file.size === f.size))
+        .map(f => ({ file: f, status: 'queued' as RowStatus })),
     ])
-  }
-
-  function updateRow(i: number, patch: Partial<FileRow>) {
-    setRows(prev => prev.map((r, idx) => idx === i ? { ...r, ...patch } : r))
   }
 
   function removeRow(i: number) {
     setRows(prev => prev.filter((_, idx) => idx !== i))
   }
 
-  async function classifyAll() {
-    const pending = rows.map((r, i) => ({ r, i })).filter(({ r }) => r.status === 'pending')
-    await Promise.all(pending.map(async ({ r, i }) => {
-      updateRow(i, { status: 'classifying' })
-      try {
-        const fd = new FormData()
-        fd.append('file', r.file)
-        const res = await fetch('/api/extract-metadata', { method: 'POST', body: fd })
-        const data = await res.json()
-        if (data.error) throw new Error(data.error)
-        updateRow(i, {
-          status: 'ready',
-          company: data.company ?? '',
-          quarter: data.quarter ?? '',
-          doc_type: data.doc_type ?? '',
-          analyst_firm: data.analyst_firm ?? '',
-          analyst_name: data.analyst_name ?? '',
-        })
-      } catch (err) {
-        updateRow(i, {
-          status: 'ready', // still go to ready so user can fix manually
-          error: err instanceof Error ? err.message : 'Classification failed',
-        })
-      }
-    }))
+  function updateRow(i: number, patch: Partial<FileRow>) {
+    setRows(prev => prev.map((r, idx) => idx === i ? { ...r, ...patch } : r))
   }
 
-  async function processAll() {
-    const ready = rows.map((r, i) => ({ r, i })).filter(({ r }) => r.status === 'ready' && r.company && r.quarter)
+  async function ingestAll() {
+    const queued = rows.map((r, i) => ({ r, i })).filter(({ r }) => r.status === 'queued')
+    if (queued.length === 0) return
+    setRunning(true)
 
-    // Process sequentially to avoid overwhelming the API
-    for (const { r, i } of ready) {
-      // Step 1: Upload
-      updateRow(i, { status: 'uploading' })
+    for (const { r, i } of queued) {
       try {
+        // Step 1: classify silently (no review)
+        updateRow(i, { status: 'uploading' })
+        const metaFd = new FormData()
+        metaFd.append('file', r.file)
+        const metaRes = await fetch('/api/extract-metadata', { method: 'POST', body: metaFd })
+        const meta = await metaRes.json()
+
+        // Upload with whatever metadata was extracted
         const fd = new FormData()
         fd.append('file', r.file)
-        fd.append('company_name', r.company)
-        fd.append('doc_type', r.doc_type || 'other')
-        fd.append('quarter', r.quarter)
-        if (r.analyst_firm) fd.append('analyst_firm', r.analyst_firm)
-        if (r.analyst_name) fd.append('analyst_name', r.analyst_name)
+        fd.append('company_name', meta.company || 'Unknown')
+        fd.append('doc_type', meta.doc_type || 'other')
+        fd.append('quarter', meta.quarter || 'Unknown')
+        if (meta.analyst_firm) fd.append('analyst_firm', meta.analyst_firm)
+        if (meta.analyst_name) fd.append('analyst_name', meta.analyst_name)
 
         const uploadRes = await fetch('/api/upload', { method: 'POST', body: fd })
         const uploadData = await uploadRes.json()
         if (!uploadRes.ok) throw new Error(uploadData.error)
 
         const documentId = uploadData.document?.id
-        if (!documentId) throw new Error('No document ID returned')
+        if (!documentId) throw new Error('Upload failed — no document ID returned')
 
-        // Step 2: Extract (only for transcripts and analyst reports)
-        if (['transcript', 'analyst_report'].includes(r.doc_type)) {
+        // Step 2: extract in background (transcripts + analyst reports only)
+        if (['transcript', 'analyst_report'].includes(meta.doc_type)) {
           updateRow(i, { status: 'extracting' })
           const extractRes = await fetch('/api/extract', {
             method: 'POST',
@@ -110,8 +74,8 @@ export default function UploadPage() {
           })
           const extractData = await extractRes.json()
           if (extractData.failed > 0) {
-            const failedResult = extractData.results?.find((r: { ok: boolean }) => !r.ok)
-            throw new Error(failedResult?.message ?? 'Extraction failed')
+            // Don't fail the whole row — doc is uploaded, extraction can be retried from Corpus
+            console.warn('Extraction failed for', r.file.name, extractData)
           }
         }
 
@@ -120,21 +84,21 @@ export default function UploadPage() {
         updateRow(i, { status: 'error', error: err instanceof Error ? err.message : 'Failed' })
       }
     }
+
+    setRunning(false)
   }
 
-  const hasPending = rows.some(r => r.status === 'pending')
-  const hasReady = rows.some(r => r.status === 'ready' && r.company && r.quarter)
-  const isProcessing = rows.some(r => r.status === 'uploading' || r.status === 'extracting' || r.status === 'classifying')
-  const allDone = rows.length > 0 && rows.every(r => r.status === 'done' || r.status === 'error')
-  const readyCount = rows.filter(r => r.status === 'ready' && r.company && r.quarter).length
+  const queuedCount = rows.filter(r => r.status === 'queued').length
+  const doneCount   = rows.filter(r => r.status === 'done').length
+  const allSettled  = rows.length > 0 && rows.every(r => r.status === 'done' || r.status === 'error')
 
   return (
-    <div className="max-w-5xl mx-auto py-10 px-4">
+    <div className="max-w-2xl mx-auto py-10 px-4">
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-gray-900 mb-1">Upload Documents</h1>
         <p className="text-sm text-gray-500">
-          Drop any mix of transcripts, analyst reports, or results documents across any companies.
-          The AI classifies each file automatically — review, correct if needed, then process.
+          Drop any PDFs — transcripts, analyst reports, results, presentations.
+          Company, quarter, and document type are detected automatically.
         </p>
       </div>
 
@@ -143,149 +107,89 @@ export default function UploadPage() {
         onDragOver={e => { e.preventDefault(); setDragging(true) }}
         onDragLeave={() => setDragging(false)}
         onDrop={e => { e.preventDefault(); setDragging(false); addFiles(Array.from(e.dataTransfer.files)) }}
-        onClick={() => fileInputRef.current?.click()}
-        className={`border-2 border-dashed rounded-xl p-12 text-center cursor-pointer transition-colors mb-6 ${
-          dragging ? 'border-blue-400 bg-blue-50' : 'border-gray-300 hover:border-blue-400 hover:bg-gray-50'
+        onClick={() => !running && fileInputRef.current?.click()}
+        className={`border-2 border-dashed rounded-xl p-12 text-center transition-colors mb-6 ${
+          running ? 'cursor-default border-gray-200 bg-gray-50' :
+          dragging ? 'border-blue-400 bg-blue-50 cursor-copy' :
+          'border-gray-300 hover:border-blue-400 hover:bg-gray-50 cursor-pointer'
         }`}
       >
         <div className="text-4xl mb-3">📂</div>
-        <p className="text-sm font-medium text-gray-700">Drop PDFs here or click to browse</p>
-        <p className="text-xs text-gray-400 mt-1">Any company · Any quarter · Multiple files</p>
+        <p className="text-sm font-medium text-gray-700">
+          {running ? 'Processing…' : 'Drop PDFs here or click to browse'}
+        </p>
+        <p className="text-xs text-gray-400 mt-1">Any company · Any quarter · Mix of document types</p>
         <input ref={fileInputRef} type="file" accept=".pdf" multiple className="hidden"
-          onChange={e => addFiles(Array.from(e.target.files ?? []))} />
+          onChange={e => { addFiles(Array.from(e.target.files ?? [])); e.target.value = '' }} />
       </div>
 
-      {/* File table */}
+      {/* File list */}
       {rows.length > 0 && (
         <div className="mb-5 rounded-xl border border-gray-200 overflow-hidden">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="bg-gray-50 border-b border-gray-200 text-xs font-medium text-gray-500">
-                <th className="text-left px-4 py-3">File</th>
-                <th className="text-left px-4 py-3">Company</th>
-                <th className="text-left px-4 py-3">Quarter</th>
-                <th className="text-left px-4 py-3">Type</th>
-                <th className="text-left px-4 py-3">Analyst firm</th>
-                <th className="text-left px-4 py-3">Status</th>
-                <th className="px-4 py-3 w-6" />
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100">
-              {rows.map((row, i) => (
-                <tr key={i} className={
-                  row.status === 'done' ? 'bg-green-50' :
-                  row.status === 'error' ? 'bg-red-50' :
-                  row.status === 'extracting' || row.status === 'uploading' ? 'bg-blue-50' : 'bg-white'
-                }>
-                  <td className="px-4 py-3 max-w-[180px]">
-                    <span className="truncate block text-xs text-gray-700 font-medium" title={row.file.name}>
-                      {row.file.name}
-                    </span>
-                    {row.error && <span className="text-xs text-red-500 block mt-0.5 truncate" title={row.error}>{row.error}</span>}
-                  </td>
-
-                  {/* Company */}
-                  <td className="px-4 py-3">
-                    {row.status === 'ready' ? (
-                      <input value={row.company} onChange={e => updateRow(i, { company: e.target.value })}
-                        placeholder="Company"
-                        className="w-32 border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400" />
-                    ) : (
-                      <span className="text-xs text-gray-700">{row.company || '—'}</span>
-                    )}
-                  </td>
-
-                  {/* Quarter */}
-                  <td className="px-4 py-3">
-                    {row.status === 'ready' ? (
-                      <input value={row.quarter} onChange={e => updateRow(i, { quarter: e.target.value })}
-                        placeholder="Q4FY26"
-                        className="w-20 border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400" />
-                    ) : (
-                      <span className="text-xs text-gray-700">{row.quarter || '—'}</span>
-                    )}
-                  </td>
-
-                  {/* Doc type */}
-                  <td className="px-4 py-3">
-                    {row.status === 'ready' ? (
-                      <select value={row.doc_type} onChange={e => updateRow(i, { doc_type: e.target.value })}
-                        className="border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400">
-                        <option value="">Select…</option>
-                        {DOC_TYPES.map(t => <option key={t} value={t}>{DOC_TYPE_LABELS[t]}</option>)}
-                      </select>
-                    ) : (
-                      <span className="text-xs text-gray-700">{DOC_TYPE_LABELS[row.doc_type] || '—'}</span>
-                    )}
-                  </td>
-
-                  {/* Analyst firm */}
-                  <td className="px-4 py-3">
-                    {row.status === 'ready' ? (
-                      <input value={row.analyst_firm} onChange={e => updateRow(i, { analyst_firm: e.target.value })}
-                        placeholder="Firm (optional)"
-                        className="w-28 border border-gray-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400" />
-                    ) : (
-                      <span className="text-xs text-gray-500">{row.analyst_firm || '—'}</span>
-                    )}
-                  </td>
-
-                  {/* Status */}
-                  <td className="px-4 py-3 whitespace-nowrap">
-                    {row.status === 'pending'     && <span className="text-xs text-gray-400">Pending</span>}
-                    {row.status === 'classifying' && <span className="text-xs text-blue-500 animate-pulse">Classifying…</span>}
-                    {row.status === 'ready'       && <span className="text-xs text-amber-600 font-medium">Review</span>}
-                    {row.status === 'uploading'   && <span className="text-xs text-blue-500 animate-pulse">Uploading…</span>}
-                    {row.status === 'extracting'  && <span className="text-xs text-blue-600 animate-pulse font-medium">Extracting…</span>}
-                    {row.status === 'done'        && <span className="text-xs text-green-700 font-medium">✓ Done</span>}
-                    {row.status === 'error'       && <span className="text-xs text-red-600 font-medium">✕ Error</span>}
-                  </td>
-
-                  <td className="px-4 py-3">
-                    {!['done', 'uploading', 'extracting', 'classifying'].includes(row.status) && (
-                      <button onClick={() => removeRow(i)} className="text-gray-300 hover:text-red-400 text-xs">✕</button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <ul className="divide-y divide-gray-100">
+            {rows.map((row, i) => (
+              <li key={i} className="flex items-center gap-3 px-4 py-3">
+                <FileIcon status={row.status} />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-gray-800 truncate font-medium" title={row.file.name}>
+                    {row.file.name}
+                  </p>
+                  {row.error && <p className="text-xs text-red-500 mt-0.5 truncate">{row.error}</p>}
+                </div>
+                <StatusPill status={row.status} />
+                {row.status === 'queued' && !running && (
+                  <button onClick={() => removeRow(i)} className="text-gray-300 hover:text-red-400 text-xs flex-shrink-0">✕</button>
+                )}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 
       {/* Actions */}
-      {rows.length > 0 && !allDone && (
-        <div className="flex gap-3 items-center">
-          {hasPending && !isProcessing && (
-            <button onClick={classifyAll}
-              className="px-5 py-2.5 bg-gray-800 text-white text-sm font-medium rounded-lg hover:bg-gray-900 transition-colors">
-              Classify {rows.filter(r => r.status === 'pending').length} file{rows.filter(r => r.status === 'pending').length > 1 ? 's' : ''}
-            </button>
-          )}
-          {hasReady && !isProcessing && (
-            <button onClick={processAll}
-              className="px-5 py-2.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors">
-              Upload &amp; extract {readyCount} file{readyCount > 1 ? 's' : ''} →
-            </button>
-          )}
-          {isProcessing && (
-            <span className="text-sm text-gray-500 animate-pulse">Processing…</span>
-          )}
-          <p className="text-xs text-gray-400">
-            Transcripts and analyst reports are fully extracted during upload.
-          </p>
-        </div>
-      )}
-
-      {allDone && (
-        <div className="p-4 bg-green-50 border border-green-200 rounded-xl text-sm text-green-800 flex items-center justify-between">
-          <span>✓ All files uploaded and extracted. Ready for predictions.</span>
-          <div className="flex gap-3">
-            <a href="/" className="text-green-700 underline hover:text-green-900 text-xs">Start session →</a>
-            <button onClick={() => setRows([])} className="text-green-600 underline hover:text-green-900 text-xs">Upload more</button>
-          </div>
-        </div>
-      )}
+      <div className="flex items-center gap-4">
+        {queuedCount > 0 && (
+          <button
+            onClick={ingestAll}
+            disabled={running}
+            className="px-5 py-2.5 bg-blue-600 text-white text-sm font-semibold rounded-lg hover:bg-blue-700 disabled:opacity-40 transition-colors"
+          >
+            {running ? 'Ingesting…' : `Ingest ${queuedCount} file${queuedCount > 1 ? 's' : ''}`}
+          </button>
+        )}
+        {allSettled && doneCount > 0 && (
+          <a href="/corpus" className="text-sm text-blue-600 hover:text-blue-800 font-medium">
+            View in corpus →
+          </a>
+        )}
+        {allSettled && (
+          <button
+            onClick={() => setRows([])}
+            className="text-sm text-gray-400 hover:text-gray-600"
+          >
+            Clear
+          </button>
+        )}
+      </div>
     </div>
   )
+}
+
+function FileIcon({ status }: { status: RowStatus }) {
+  const icons: Record<RowStatus, string> = {
+    queued: '📄', uploading: '⬆️', extracting: '🧠', done: '✅', error: '❌'
+  }
+  return <span className="text-lg flex-shrink-0">{icons[status]}</span>
+}
+
+function StatusPill({ status }: { status: RowStatus }) {
+  const config: Record<RowStatus, { label: string; className: string }> = {
+    queued:     { label: 'Queued',     className: 'text-gray-400' },
+    uploading:  { label: 'Uploading…', className: 'text-blue-500 animate-pulse' },
+    extracting: { label: 'Extracting…',className: 'text-blue-600 animate-pulse font-medium' },
+    done:       { label: 'Done',       className: 'text-green-600 font-medium' },
+    error:      { label: 'Error',      className: 'text-red-500 font-medium' },
+  }
+  const c = config[status]
+  return <span className={`text-xs flex-shrink-0 ${c.className}`}>{c.label}</span>
 }

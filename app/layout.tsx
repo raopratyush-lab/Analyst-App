@@ -34,11 +34,11 @@ export default function RootLayout({
             <Link href="/" className="text-sm font-semibold text-gray-900 hover:text-blue-600">
               Analyst Agent
             </Link>
+            <Link href="/corpus" className="text-sm text-gray-500 hover:text-gray-900">
+              Corpus
+            </Link>
             <Link href="/upload" className="text-sm text-gray-500 hover:text-gray-900">
               Upload
-            </Link>
-            <Link href="/api-test" className="text-sm text-gray-500 hover:text-gray-900">
-              API Test
             </Link>
           </div>
         </nav>
